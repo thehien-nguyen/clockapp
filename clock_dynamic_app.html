@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Đồng Hồ Gia Đình (Mini-App)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Thiết lập font Inter mặc định và đảm bảo căn giữa */
+        body {
+            font-family: 'Inter', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f0f4f8; /* Nền ngoài màu xám nhạt */
+        }
+        
+        /* Đảm bảo canvas có kích thước linh hoạt và căn giữa */
+        .app-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+            padding: 20px;
+            max-width: 440px;
+            width: 95vw;
+        }
+
+        .clock-container {
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+            border-radius: 9999px; /* Tròn hoàn toàn */
+            position: relative;
+            background-color: white;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Vị trí cho thông báo (Notification) */
+        #notification-box {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 15px 25px;
+            background-color: rgba(255, 255, 255, 0.95);
+            border-radius: 12px;
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+            color: #333;
+            font-size: 1.1rem;
+            font-weight: 600;
+            text-align: center;
+            z-index: 10;
+            opacity: 0;
+            transition: opacity 0.5s ease;
+            pointer-events: none;
+            max-width: 80%;
+            border: 3px solid #ff3333; /* Viền đỏ cho thông báo đặc biệt */
+        }
+
+        .show-notification {
+            opacity: 1 !important;
+        }
+
+        .calendar-placeholder {
+            font-size: 0.9rem;
+            color: #ccc;
+            margin-top: 10px;
+        }
+
+        /* Overlay bắt buộc click để bật âm thanh */
+        #audio-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.9);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            transition: opacity 0.5s;
+        }
+        #audio-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+    </style>
+    <!-- Bắt đầu các thẻ meta PWA/Mini-App -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#4A90E2">
+    <!-- Link tới Manifest (Mô tả ứng dụng, cần có manifest.json riêng) -->
+    <link rel="manifest" href="/family-clock-manifest.json">
+    <!-- Kết thúc các thẻ meta PWA/Mini-App -->
+</head>
+<body>
+    <div class="app-container">
+        <!-- Vùng chứa Đồng Hồ -->
+        <div class="clock-container">
+            <canvas id="analogClock"></canvas>
+            <div id="notification-box"></div>
+        </div>
+        
+        <!-- Placeholder cho Google Calendar -->
+        <div class="calendar-placeholder">
+            (*) Tính năng Google Calendar được mô phỏng. Trên ứng dụng thực tế, sự kiện sẽ xuất hiện ở đây.
+        </div>
+    </div>
+    
+    <!-- Audio Context cho TTS -->
+    <audio id="ttsAudio" style="display: none;"></audio>
+
+    <!-- Overlay Bắt Buộc Nhấn để Kích Hoạt Âm Thanh -->
+    <div id="audio-overlay">
+        <button id="enable-audio-btn" class="px-6 py-3 text-lg font-bold text-white bg-blue-600 rounded-lg shadow-xl hover:bg-blue-700 transition duration-300 transform hover:scale-105">
+            Nhấn để Bật Giọng Nói (TTS)
+        </button>
+    </div>
+
+
+    <script>
+        // --- CẤU HÌNH API VÀ ÂM THANH ---
+        const TTS_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=";
+        const ROOSTER_VOICE = "Fenrir"; // Giọng mạnh mẽ, thích hợp cho tiếng gà gáy
+        const FRIENDLY_VOICE = "Kore"; // Giọng thân thiện, thích hợp cho lời chúc
+
+        // Trạng thái cờ để đảm bảo báo thức chỉ reo 1 lần mỗi giờ
+        const alarmFlags = {
+            '06:00': false,
+            '21:00': false,
+            '22:00': false,
+            'BIRTHDAY': false
+        };
+
+        // Danh sách lời chúc ngẫu nhiên
+        const randomGreetings = [
+            "Chúc bạn ngày mới tốt đẹp!",
+            "Một ngày mới thật năng lượng nhé!",
+            "Sẵn sàng chinh phục mục tiêu nào!",
+            "Bình minh rực rỡ đang chờ bạn!",
+            "Hôm nay sẽ là một ngày tuyệt vời!"
+        ];
+        
+        // Cờ kiểm tra trạng thái âm thanh đã được người dùng bật chưa
+        let audioContextReady = false; 
+
+        // --- CÁC HÀM XỬ LÝ AUDIO (PCM to WAV) ---
+
+        // Chuyển Base64 sang ArrayBuffer
+        function base64ToArrayBuffer(base64) {
+            const binaryString = atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        // Chuyển PCM sang WAV
+        function pcmToWav(pcmData, sampleRate) {
+            const numChannels = 1; // Mono
+            const bytesPerSample = 2; // 16-bit
+            const blockAlign = numChannels * bytesPerSample;
+            const byteRate = sampleRate * blockAlign;
+            const dataSize = pcmData.byteLength;
+            
+            const buffer = new ArrayBuffer(44 + dataSize);
+            const view = new DataView(buffer);
+            let offset = 0;
+
+            // RIFF chunk descriptor
+            writeString(view, offset, 'RIFF'); offset += 4;
+            view.setUint32(offset, 36 + dataSize, true); offset += 4; // ChunkSize
+            writeString(view, offset, 'WAVE'); offset += 4;
+
+            // fmt chunk
+            writeString(view, offset, 'fmt '); offset += 4;
+            view.setUint32(offset, 16, true); offset += 4; // Subchunk1Size
+            view.setUint16(offset, 1, true); offset += 2; // AudioFormat (1=PCM)
+            view.setUint16(offset, numChannels, true); offset += 2; // NumChannels
+            view.setUint32(offset, sampleRate, true); offset += 4; // SampleRate
+            view.setUint32(offset, byteRate, true); offset += 4; // ByteRate
+            view.setUint16(offset, blockAlign, true); offset += 2; // BlockAlign
+            view.setUint16(offset, bytesPerSample * 8, true); offset += 2; // BitsPerSample
+
+            // data chunk
+            writeString(view, offset, 'data'); offset += 4;
+            view.setUint32(offset, dataSize, true); offset += 4;
+            
+            // Copy PCM data
+            const pcmArray = new Int16Array(pcmData);
+            for (let i = 0; i < pcmArray.length; i++) {
+                view.setInt16(offset, pcmArray[i], true);
+                offset += 2;
+            }
+
+            return new Blob([view], { type: 'audio/wav' });
+        }
+        
+        function writeString(view, offset, str) {
+            for (let i = 0; i < str.length; i++) {
+                view.setUint8(offset + i, str.charCodeAt(i));
+            }
+        }
+
+        // Hàm phát TTS
+        async function playTTS(text, voiceName, maxRetries = 3) {
+            // KIỂM TRA: Chỉ phát TTS nếu người dùng đã bật âm thanh
+            if (!audioContextReady) {
+                console.log("TTS blocked: User interaction required to enable audio.");
+                return;
+            }
+
+            const audioEl = document.getElementById('ttsAudio');
+            if (audioEl.paused === false) audioEl.pause(); // Dừng nếu đang phát
+
+            const payload = {
+                contents: [{ parts: [{ text: text }] }],
+                generationConfig: {
+                    responseModalities: ["AUDIO"],
+                    speechConfig: {
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } }
+                    }
+                },
+                model: "gemini-2.5-flash-preview-tts"
+            };
+
+            let response;
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                    response = await fetch(TTS_API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        break; // Thành công, thoát vòng lặp
+                    } else if (response.status === 429 && attempt < maxRetries - 1) {
+                        // Xử lý lỗi Rate Limit với Exponential Backoff
+                        const delay = Math.pow(2, attempt) * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    } else {
+                        console.error('TTS API error:', response.status, await response.text());
+                        return;
+                    }
+                } catch (error) {
+                    console.error('Fetch error during TTS call:', error);
+                    if (attempt < maxRetries - 1) {
+                        const delay = Math.pow(2, attempt) * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    } else {
+                        return;
+                    }
+                }
+            }
+            
+            if (!response || !response.ok) return;
+
+            try {
+                const result = await response.json();
+                const part = result?.candidates?.[0]?.content?.parts?.[0];
+                const audioData = part?.inlineData?.data;
+                const mimeType = part?.inlineData?.mimeType;
+
+                if (audioData && mimeType && mimeType.startsWith("audio/L16")) {
+                    // Lấy sample rate từ mimeType (ví dụ: audio/L16;rate=24000)
+                    const rateMatch = mimeType.match(/rate=(\d+)/);
+                    const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000; 
+
+                    const pcmData = base64ToArrayBuffer(audioData);
+                    const wavBlob = pcmToWav(pcmData, sampleRate);
+                    
+                    audioEl.src = URL.createObjectURL(wavBlob);
+                    audioEl.play().catch(e => console.error("Error playing audio after enablement:", e));
+                } else {
+                    console.error("TTS response structure missing audio data or invalid mime type:", part);
+                }
+            } catch (error) {
+                console.error("Error processing TTS response:", error);
+            }
+        }
+
+        // --- CÁC THIẾT LẬP CANVAS VÀ THỜI GIAN ---
+        const canvas = document.getElementById('analogClock');
+        const ctx = canvas.getContext('2d');
+        const notificationBox = document.getElementById('notification-box');
+        let radius;
+        let animationFrameId;
+
+        // Hàm chính để vẽ đồng hồ
+        function drawClock() {
+            const now = new Date();
+            const h = now.getHours();
+            const m = now.getMinutes();
+            const s = now.getSeconds();
+            
+            // Lấy kích thước thực tế của canvas
+            const size = Math.min(canvas.width, canvas.height);
+            radius = size / 2;
+            
+            // Di chuyển gốc tọa độ về tâm canvas
+            ctx.clearRect(0, 0, size, size); // Xóa canvas
+            ctx.save();
+            ctx.translate(radius, radius); 
+
+            // 1. Vẽ mặt đồng hồ (Nền xanh dương bóng)
+            drawFace(ctx, radius);
+
+            // 2. Vẽ các vạch số và kim cương
+            drawNumbers(ctx, radius);
+            
+            // 3. Vẽ ngày tháng
+            drawDate(ctx, radius, now);
+
+            // 4. Tính toán và vẽ kim
+            drawTime(ctx, radius, h, m, s);
+            
+            // 5. Xử lý các sự kiện báo thức, nhắc nhở và sinh nhật
+            handleAlarms(h, m, s, now);
+
+            // Trả lại trạng thái canvas ban đầu
+            ctx.restore(); 
+        }
+
+        // Hàm vẽ nền mặt đồng hồ với hiệu ứng bóng (Glossy Blue)
+        function drawFace(ctx, radius) {
+            
+            // Vòng tròn ngoài (Shadow/Edge)
+            ctx.beginPath();
+            ctx.arc(0, 0, radius, 0, 2 * Math.PI);
+            ctx.fillStyle = '#C6E2FF'; // Xanh nhạt viền
+            ctx.fill();
+            
+            // Tạo hiệu ứng bóng/sáng (Glossy Blue)
+            const grad = ctx.createRadialGradient(0, 0, radius * 0.9, 0, 0, radius * 1.05);
+            grad.addColorStop(0, '#4A90E2'); // Màu xanh dương đậm ở tâm
+            grad.addColorStop(0.7, '#6AAEE8'); // Màu xanh dương trung bình
+            grad.addColorStop(1, '#8AC0F0');  // Màu xanh dương nhạt ở rìa
+            
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(0, 0, radius * 0.95, 0, 2 * Math.PI);
+            ctx.fill();
+            
+            // Hiệu ứng "Gloss" - Vệt sáng bóng
+            const shine = ctx.createRadialGradient(0, -radius * 0.5, 0, 0, -radius * 0.5, radius * 0.8);
+            shine.addColorStop(0, 'rgba(255, 255, 255, 0.5)');
+            shine.addColorStop(0.8, 'rgba(255, 255, 255, 0)');
+
+            ctx.beginPath();
+            ctx.arc(0, 0, radius * 0.95, 0, 2 * Math.PI);
+            ctx.fillStyle = shine;
+            ctx.fill();
+        }
+
+        // SVG Kim Cương và Gà Trống
+        // (Lưu ý: SVG không thể vẽ trực tiếp lên Canvas, chỉ dùng cho mục đích tham khảo. 
+        // Chúng ta đang dùng kỹ thuật vẽ hình học và Emoji)
+        const diamondSVG = `...`; 
+        const roosterSVG = `...`; 
+
+        // Hàm vẽ số giờ và Kim cương/Gà trống
+        function drawNumbers(ctx, radius) {
+            let ang;
+            let num;
+            ctx.font = radius * 0.15 + "px Arial";
+            ctx.textBaseline = "middle";
+            ctx.textAlign = "center";
+            ctx.fillStyle = 'white'; 
+            const hour = new Date().getHours();
+
+            for (num = 1; num < 13; num++) {
+                ang = num * Math.PI / 6;
+                ctx.rotate(ang);
+                ctx.translate(0, -radius * 0.85);
+                ctx.rotate(-ang);
+
+                if (num === 12) {
+                    // 12 giờ: Kim cương lấp lánh
+                    // Lấp lánh đơn giản bằng cách thay đổi màu hoặc kích thước
+                    const diamondSize = radius * 0.1;
+                    ctx.fillStyle = '#E0FFFF'; // Màu kim cương
+                    ctx.shadowColor = (new Date().getMilliseconds() % 1000 < 500) ? 'yellow' : 'white';
+                    ctx.shadowBlur = 10;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(0, -diamondSize);
+                    ctx.lineTo(diamondSize/2, 0);
+                    ctx.lineTo(0, diamondSize);
+                    ctx.lineTo(-diamondSize/2, 0);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    ctx.shadowBlur = 0; // Tắt bóng
+                    ctx.fillStyle = 'white';
+
+                } else if (num === 5 && hour === 5 && new Date().getMinutes() < 30) {
+                    // 5 giờ sáng: Hiển thị gà trống (Dùng Text làm placeholder cho SVG)
+                    ctx.font = radius * 0.18 + "px Arial";
+                    ctx.fillStyle = '#FFC300';
+                    ctx.fillText("🐔", 0, 0); // Emoji Gà trống
+                    ctx.font = radius * 0.15 + "px Arial"; // Trả về font cũ
+                    ctx.fillStyle = 'white';
+                } else {
+                    ctx.fillText(num.toString(), 0, 0);
+                }
+                
+                ctx.rotate(ang);
+                ctx.translate(0, radius * 0.85);
+                ctx.rotate(-ang);
+            }
+        }
+        
+        // Hàm vẽ Ngày tháng
+        function drawDate(ctx, radius, now) {
+            const days = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+            const months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+            
+            const dayOfWeek = days[now.getDay()];
+            const month = months[now.getMonth()];
+            const date = now.getDate();
+            
+            const dateStr = `${dayOfWeek}, ${month} ${date}`;
+            
+            ctx.font = radius * 0.08 + "px Arial";
+            ctx.fillStyle = '#E0FFFF'; // Màu trắng xanh
+            ctx.textAlign = "center";
+            ctx.fillText(dateStr, 0, radius * 0.45); // Vị trí dưới tâm
+        }
+
+
+        // Hàm vẽ kim đồng hồ
+        function drawTime(ctx, radius, h, m, s) {
+            
+            // Góc kim giờ: 30 độ/giờ + 0.5 độ/phút + 0.0083 độ/giây
+            let hourAngle = (h % 12 + m / 60 + s / 3600) * Math.PI / 6;
+            drawHand(ctx, hourAngle, radius * 0.5, radius * 0.07, 'black'); // Kim giờ màu đen
+
+            // Góc kim phút: 6 độ/phút + 0.1 độ/giây
+            let minuteAngle = (m + s / 60) * Math.PI / 30;
+            drawHand(ctx, minuteAngle, radius * 0.75, radius * 0.05, 'black'); // Kim phút màu đen
+
+            // Góc kim giây: 6 độ/giây
+            let secondAngle = s * Math.PI / 30;
+            drawHand(ctx, secondAngle, radius * 0.85, radius * 0.02, '#FFD700'); // Kim giây màu vàng (#FFD700 - Gold)
+
+            // Vẽ chốt tâm
+            ctx.beginPath();
+            ctx.arc(0, 0, radius * 0.05, 0, 2 * Math.PI);
+            ctx.fillStyle = '#333';
+            ctx.fill();
+        }
+
+        // Hàm vẽ kim chung
+        function drawHand(ctx, pos, length, width, color) {
+            ctx.beginPath();
+            ctx.lineWidth = width;
+            ctx.lineCap = "round";
+            ctx.strokeStyle = color;
+            
+            // Xoay canvas theo vị trí (pos)
+            ctx.rotate(pos - Math.PI / 2); 
+            ctx.moveTo(0, 0);
+            ctx.lineTo(length, 0);
+            ctx.stroke();
+            
+            // Trả lại góc quay ban đầu
+            ctx.rotate(-(pos - Math.PI / 2));
+        }
+
+        // Hàm hiển thị thông báo
+        function showNotification(message, duration = 5000) {
+            notificationBox.textContent = message;
+            notificationBox.classList.add('show-notification');
+            setTimeout(() => {
+                notificationBox.classList.remove('show-notification');
+            }, duration);
+        }
+
+        // Hàm xử lý các sự kiện báo thức và nhắc nhở
+        function handleAlarms(h, m, s, now) {
+            const timeKey = `${h < 10 ? '0' + h : h}:${m < 10 ? '0' + m : m}`;
+            
+            // 1. Kiểm tra Sinh Nhật (30/09)
+            // Lưu ý: JavaScript month là 0-indexed, nên tháng 10 là 9.
+            const isBirthday = now.getMonth() === 9 && now.getDate() === 30; 
+            
+            // --- Hiển thị dòng chữ Chúc mừng Sinh Nhật (6:00 đến 21:59) ---
+            // Yêu cầu: Hiển thị từ 6:00 sáng đến 22:00 (đi ngủ)
+            if (isBirthday && h >= 6 && h < 22) { 
+                // Thông báo trên mặt đồng hồ
+                ctx.font = radius * 0.1 + "px Arial";
+                ctx.fillStyle = '#FF3333';
+                ctx.textAlign = "center";
+                // Dòng chữ chúc mừng sinh nhật được hiển thị trong khoảng thời gian mới
+                ctx.fillText("❤️ happy birthday my love and my son ❤️", 0, radius * 0.65);
+            } 
+            
+            // --- Kích hoạt TTS Sinh Nhật (Chỉ 1 lần lúc 6:00:00) ---
+            if (isBirthday && !alarmFlags.BIRTHDAY && h === 6 && m === 0 && s === 0) {
+                // Phát TTS
+                const birthdayTTS = "Chúc mừng sinh nhật hai mẹ con Gấu!";
+                playTTS(birthdayTTS, FRIENDLY_VOICE);
+                alarmFlags.BIRTHDAY = true; // Đảm bảo chỉ phát 1 lần trong ngày
+            } else if (!isBirthday) {
+                // Đặt lại cờ cho năm sau
+                alarmFlags.BIRTHDAY = false;
+            }
+
+
+            // 2. Kiểm tra Báo Thức khác (Chỉ kích hoạt khi m=00 và s=00)
+            if (m === 0 && s === 0) {
+                // Reset cờ cho tất cả các giờ khác
+                Object.keys(alarmFlags).forEach(key => {
+                    if (key !== timeKey && key !== 'BIRTHDAY') {
+                        alarmFlags[key] = false;
+                    }
+                });
+
+                if (timeKey === '06:00' && !alarmFlags['06:00'] && !isBirthday) { // Chỉ gáy khi KHÔNG phải sinh nhật
+                    // 6:00 sáng: Gà gáy và lời chúc
+                    showNotification(randomGreetings[Math.floor(Math.random() * randomGreetings.length)], 8000);
+                    playTTS("Ò ó o o o", ROOSTER_VOICE);
+                    alarmFlags['06:00'] = true;
+                } 
+                else if (timeKey === '21:00' && !alarmFlags['21:00']) {
+                    // 21:00: Nhắc nhở đi ngủ
+                    const reminder = "Bạn ơi sắp đến giờ đi ngủ rồi đấy, hãy mau hoàn thành công việc và chuẩn bị đi ngủ thôi.";
+                    showNotification(reminder, 10000);
+                    playTTS(reminder, FRIENDLY_VOICE);
+                    alarmFlags['21:00'] = true;
+                }
+                else if (timeKey === '22:00' && !alarmFlags['22:00']) {
+                    // 22:00: Chúc ngủ ngon
+                    const goodnight = "Chúc ngủ ngon nhé.";
+                    showNotification(goodnight, 5000);
+                    playTTS(goodnight, FRIENDLY_VOICE);
+                    alarmFlags['22:00'] = true;
+                }
+            }
+
+            // 3. Hiển thị Gà trống (5:00 - 5:30)
+            if (h === 5 && m >= 0 && m < 30) {
+                // Không cần vẽ lại gà trống ở đây vì nó đã được xử lý trong drawNumbers
+            }
+        }
+        
+        // --- VÒNG LẶP VÀ KHỞI TẠO ---
+
+        // Hàm khởi động vòng lặp animation
+        function startClock() {
+             if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+            }
+            const update = () => {
+                drawClock();
+                // Sử dụng requestAnimationFrame để đồng bộ với màn hình, nhưng chỉ cần cập nhật mỗi giây
+                setTimeout(() => {
+                    animationFrameId = requestAnimationFrame(update);
+                }, 1000 - (new Date().getMilliseconds())); 
+            };
+            animationFrameId = requestAnimationFrame(update);
+        }
+
+
+        // Đặt lại kích thước canvas khi tải trang hoặc thay đổi kích thước cửa sổ
+        function resizeCanvas() {
+            const container = document.querySelector('.clock-container');
+            const containerSize = container.offsetWidth;
+            
+            // Thiết lập cả width và height của canvas
+            canvas.width = containerSize;
+            canvas.height = containerSize;
+            
+            // Vẽ lại đồng hồ ngay sau khi thay đổi kích thước
+            // Gọi startClock() để đảm bảo vòng lặp bắt đầu
+            startClock();
+        }
+
+        // Hàm xử lý khi người dùng nhấn nút Bật âm thanh
+        function enableAudio() {
+            const overlay = document.getElementById('audio-overlay');
+            
+            // 1. Đánh dấu âm thanh đã sẵn sàng
+            audioContextReady = true; 
+            
+            // 2. Ẩn màn hình chờ
+            overlay.classList.add('hidden');
+
+            // 3. Kích hoạt audio context (cần thiết cho một số trình duyệt iOS/Safari)
+            const audioEl = document.getElementById('ttsAudio');
+            // Thử phát 1 đoạn audio im lặng để "mở khóa"
+            audioEl.volume = 0;
+            audioEl.play().then(() => {
+                audioEl.pause();
+                audioEl.volume = 1;
+            }).catch(e => {
+                // Nếu thất bại (ví dụ: máy tính để bàn), vẫn tiếp tục vì cờ đã bật
+                console.warn("Silent audio context unlocking failed:", e);
+            });
+            
+            // Nếu bạn muốn thử nghiệm ngay, có thể gọi playTTS test ở đây
+            // playTTS("Giọng nói đã được kích hoạt thành công.", FRIENDLY_VOICE);
+        }
+
+
+        // Khởi tạo
+        window.onload = function() {
+            resizeCanvas(); 
+            window.addEventListener('resize', resizeCanvas); 
+            
+            // Gán sự kiện click cho nút bật âm thanh
+            document.getElementById('enable-audio-btn').addEventListener('click', enableAudio);
+        }
+    </script>
+
+</body>
+</html>
